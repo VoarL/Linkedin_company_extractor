@@ -14,6 +14,7 @@ Each category (Digital, Analog, etc.) gets its own text file with format:
     ----------------------------------------
 """
 
+import os
 import re
 import time
 import random
@@ -113,6 +114,210 @@ def format_description_from_html(html):
     return '\n'.join(cleaned_lines).strip()
 
 
+def get_job_site_type(url):
+    """Identify the job board type from URL."""
+    if not url:
+        return None
+    if 'linkedin.com' in url:
+        return 'linkedin'
+    if 'greenhouse.io' in url:
+        return 'greenhouse'
+    if 'myworkdayjobs.com' in url or 'workday.com' in url:
+        return 'workday'
+    if 'lever.co' in url:
+        return 'lever'
+    if 'oraclecloud.com' in url:
+        return 'oracle'
+    if 'careers.' in url or 'jobs.' in url:
+        return 'generic'
+    return 'generic'
+
+
+def extract_generic_job_info(driver, url):
+    """Extract job info from generic job pages using common patterns."""
+    try:
+        driver.get(url)
+        time.sleep(random.uniform(3, 5))
+
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        company = None
+        job_title = None
+        description = None
+
+        # Common title selectors across job sites
+        title_selectors = [
+            'h1[class*="title"]', 'h1[class*="job"]', 'h1[class*="posting"]',
+            'h1[data-automation*="title"]', '.job-title', '.posting-title',
+            'h1', 'h2[class*="title"]'
+        ]
+
+        for selector in title_selectors:
+            try:
+                element = driver.find_element(By.CSS_SELECTOR, selector)
+                if element and element.text.strip():
+                    job_title = element.text.strip()
+                    break
+            except NoSuchElementException:
+                continue
+
+        # Common company selectors
+        company_selectors = [
+            '[class*="company"]', '[data-automation*="company"]',
+            '.employer-name', '.company-name', 'a[href*="/company"]'
+        ]
+
+        for selector in company_selectors:
+            try:
+                element = driver.find_element(By.CSS_SELECTOR, selector)
+                if element and element.text.strip():
+                    company = element.text.strip()
+                    break
+            except NoSuchElementException:
+                continue
+
+        # Common description selectors
+        desc_selectors = [
+            '[class*="description"]', '[class*="job-content"]',
+            '[data-automation*="description"]', '.job-details',
+            '[class*="posting-content"]', '[class*="job-body"]',
+            'article', '.content'
+        ]
+
+        for selector in desc_selectors:
+            try:
+                element = driver.find_element(By.CSS_SELECTOR, selector)
+                if element:
+                    html = element.get_attribute('innerHTML')
+                    if html and len(html) > 100:
+                        description = format_description_from_html(html)
+                        if description and len(description) > 50:
+                            break
+            except NoSuchElementException:
+                continue
+
+        return {
+            'company': company,
+            'job_title': job_title,
+            'description': description
+        }
+
+    except TimeoutException:
+        print(f"    Timeout loading page")
+        return None
+    except Exception as e:
+        print(f"    Error: {str(e)}")
+        return None
+
+
+def extract_greenhouse_job_info(driver, url):
+    """Extract job info from Greenhouse job pages."""
+    try:
+        driver.get(url)
+        time.sleep(random.uniform(2, 4))
+
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        company = None
+        job_title = None
+        description = None
+
+        # Greenhouse-specific selectors
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, 'h1.app-title, h1[class*="title"]')
+            job_title = element.text.strip() if element else None
+        except NoSuchElementException:
+            pass
+
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '.company-name, [class*="company"]')
+            company = element.text.strip() if element else None
+        except NoSuchElementException:
+            pass
+
+        # Job description
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '#content, .content, [class*="description"]')
+            if element:
+                html = element.get_attribute('innerHTML')
+                description = format_description_from_html(html) if html else None
+        except NoSuchElementException:
+            pass
+
+        return {
+            'company': company,
+            'job_title': job_title,
+            'description': description
+        }
+
+    except Exception as e:
+        print(f"    Greenhouse error: {str(e)}")
+        return extract_generic_job_info(driver, url)
+
+
+def extract_workday_job_info(driver, url):
+    """Extract job info from Workday job pages."""
+    try:
+        driver.get(url)
+        time.sleep(random.uniform(3, 5))
+
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        company = None
+        job_title = None
+        description = None
+
+        # Workday-specific selectors
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '[data-automation-id="jobPostingHeader"], h2[data-automation-id="jobTitle"], h1')
+            job_title = element.text.strip() if element else None
+        except NoSuchElementException:
+            pass
+
+        # Description - Workday often has it in a specific div
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '[data-automation-id="jobPostingDescription"], [class*="jobDescription"]')
+            if element:
+                html = element.get_attribute('innerHTML')
+                description = format_description_from_html(html) if html else None
+        except NoSuchElementException:
+            pass
+
+        if not description:
+            return extract_generic_job_info(driver, url)
+
+        return {
+            'company': company,
+            'job_title': job_title,
+            'description': description
+        }
+
+    except Exception as e:
+        print(f"    Workday error: {str(e)}")
+        return extract_generic_job_info(driver, url)
+
+
+def extract_job_info_any(driver, url):
+    """Extract job info from any supported job site."""
+    site_type = get_job_site_type(url)
+    print(f"    Site type: {site_type}")
+
+    if site_type == 'linkedin':
+        return extract_job_info(driver, url)
+    elif site_type == 'greenhouse':
+        return extract_greenhouse_job_info(driver, url)
+    elif site_type == 'workday':
+        return extract_workday_job_info(driver, url)
+    else:
+        return extract_generic_job_info(driver, url)
+
+
 def extract_job_info(driver, url):
     """Extract job title, company, and description from a LinkedIn job page."""
     try:
@@ -197,6 +402,57 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name)
 
 
+def normalize_url(url):
+    """Normalize LinkedIn URL for comparison (remove tracking params)."""
+    if not url:
+        return None
+    # Extract the base job ID from LinkedIn URLs
+    match = re.search(r'linkedin\.com/jobs/view/(\d+)', url)
+    if match:
+        return f"linkedin.com/jobs/view/{match.group(1)}"
+    return url.split('?')[0].rstrip('/')
+
+
+def get_existing_urls(filename):
+    """Parse an existing txt file and return dict of URLs with their status.
+
+    Returns:
+        dict with 'extracted' (successfully extracted URLs) and 'skipped' (URLs marked as SKIPPED)
+    """
+    result = {'extracted': set(), 'skipped': set()}
+    if not os.path.exists(filename):
+        return result
+
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+            # Split by job entries (separated by dashes)
+            entries = re.split(r'-{40,}', content)
+
+            for entry in entries:
+                # Find URL in this entry
+                url_match = re.search(r'URL: (https?://[^\s\n]+)', entry)
+                if not url_match:
+                    continue
+
+                url = url_match.group(1)
+                normalized = normalize_url(url)
+                if not normalized:
+                    continue
+
+                # Check if this entry was skipped
+                if 'Status: SKIPPED' in entry or 'Status: ERROR' in entry:
+                    result['skipped'].add(normalized)
+                else:
+                    result['extracted'].add(normalized)
+
+    except Exception as e:
+        print(f"Warning: Could not read existing file {filename}: {e}")
+
+    return result
+
+
 def main():
     excel_path = "Job Tracker.xlsx"
 
@@ -255,52 +511,109 @@ def main():
     print(f"Non-LinkedIn/No URL: {total_jobs - linkedin_jobs}")
     print(f"\nCategories: {list(jobs_by_category.keys())}")
 
+    # Check existing files and filter out already-extracted jobs
+    jobs_to_extract = {}
+    total_new_jobs = 0
+    total_already_done = 0
+    total_retry_skipped = 0
+
+    for category, jobs in jobs_by_category.items():
+        filename = f"{sanitize_filename(category)}_jobs.txt"
+        url_status = get_existing_urls(filename)
+        extracted_urls = url_status['extracted']
+        skipped_urls = url_status['skipped']
+
+        new_jobs = []
+        for job in jobs:
+            url = job['url']
+            normalized = normalize_url(url) if url else None
+
+            if normalized and normalized in extracted_urls:
+                # Already successfully extracted
+                total_already_done += 1
+            elif normalized and normalized in skipped_urls:
+                # Was skipped before - retry it
+                new_jobs.append(job)
+                total_retry_skipped += 1
+                total_new_jobs += 1
+            else:
+                # Brand new job
+                new_jobs.append(job)
+                total_new_jobs += 1
+
+        jobs_to_extract[category] = {
+            'jobs': new_jobs,
+            'filename': filename,
+            'file_exists': os.path.exists(filename),
+            'existing_count': len(extracted_urls),
+            'skipped_count': len(skipped_urls)
+        }
+
+        if len(extracted_urls) > 0 or len(skipped_urls) > 0:
+            print(f"  {category}: {len(extracted_urls)} done, {len(skipped_urls)} skipped (retrying), {len(new_jobs)} to process")
+
+    print(f"\nTotal: {total_already_done} jobs already extracted, {total_retry_skipped} previously skipped (retrying), {total_new_jobs} to process")
+
+    if total_new_jobs == 0:
+        print("\nNo new jobs to extract. All jobs are already in the text files.")
+        return
+
     # Set up browser
     print("\nSetting up browser...")
     driver = setup_driver()
 
     try:
         processed = 0
-        for category, jobs in jobs_by_category.items():
+        for category, data in jobs_to_extract.items():
+            jobs = data['jobs']
+            filename = data['filename']
+
+            if not jobs:
+                print(f"\n{category}: No new jobs to process")
+                continue
+
             print(f"\n{'='*60}")
-            print(f"Processing category: {category} ({len(jobs)} jobs)")
+            print(f"Processing category: {category} ({len(jobs)} new jobs)")
             print('='*60)
 
-            filename = f"{sanitize_filename(category)}_jobs.txt"
+            # Append to existing file or create new one
+            mode = 'a' if data['file_exists'] else 'w'
 
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(f"{'='*60}\n")
-                f.write(f"Category: {category}\n")
-                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"{'='*60}\n\n")
+            with open(filename, mode, encoding='utf-8') as f:
+                # Write header only for new files
+                if not data['file_exists']:
+                    f.write(f"{'='*60}\n")
+                    f.write(f"Category: {category}\n")
+                    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"{'='*60}\n\n")
+                else:
+                    # Add a separator for appended content
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"Appended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"{'='*60}\n\n")
 
                 for i, job in enumerate(jobs):
                     processed += 1
                     row = job['row']
                     url = job['url']
 
-                    print(f"\n[{processed}/{total_jobs}] Row {row}...")
+                    print(f"\n[{processed}/{total_new_jobs}] Row {row}...")
 
-                    if not job['is_linkedin']:
-                        # Non-LinkedIn or no URL
-                        error_msg = f"Row {row}: Not a LinkedIn URL"
-                        if url:
-                            error_msg += f" - {url[:50]}..."
-                        else:
-                            error_msg += " - No URL"
+                    if not url:
+                        # No URL at all
+                        error_msg = f"Row {row}: No URL"
                         errors.append(error_msg)
                         print(f"  Skipping: {error_msg}")
 
-                        # Still write entry with available info
                         f.write(f"Company: {job['existing_company'] or 'N/A'}\n")
                         f.write(f"Job Title: {job['existing_title'] or 'N/A'}\n")
-                        f.write(f"URL: {url or 'N/A'}\n")
-                        f.write(f"Status: SKIPPED - Not a LinkedIn URL\n")
+                        f.write(f"URL: N/A\n")
+                        f.write(f"Status: SKIPPED - No URL\n")
                         f.write(f"\n{'-'*40}\n\n")
                         continue
 
                     print(f"  URL: {url[:50]}...")
-                    info = extract_job_info(driver, url)
+                    info = extract_job_info_any(driver, url)
 
                     if info:
                         company = info['company'] or job['existing_company'] or 'N/A'
