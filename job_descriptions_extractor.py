@@ -128,6 +128,8 @@ def get_job_site_type(url):
         return 'lever'
     if 'oraclecloud.com' in url:
         return 'oracle'
+    if 'hrmdirect.com' in url:
+        return 'hrmdirect'
     if 'careers.' in url or 'jobs.' in url:
         return 'generic'
     return 'generic'
@@ -303,6 +305,57 @@ def extract_workday_job_info(driver, url):
         return extract_generic_job_info(driver, url)
 
 
+def extract_hrmdirect_job_info(driver, url):
+    """Extract job info from HRMDirect job pages."""
+    try:
+        driver.get(url)
+        time.sleep(random.uniform(2, 4))
+
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        company = None
+        job_title = None
+        description = None
+
+        # HRMDirect-specific selectors
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '.careersTitle, h1')
+            job_title = element.text.strip() if element else None
+        except NoSuchElementException:
+            pass
+
+        # Job description - HRMDirect uses .jobDesc
+        try:
+            element = driver.find_element(By.CSS_SELECTOR, '.jobDesc, div.jobDesc')
+            if element:
+                html = element.get_attribute('innerHTML')
+                description = format_description_from_html(html) if html else None
+        except NoSuchElementException:
+            pass
+
+        # If .jobDesc didn't work, try getting all content after the title
+        if not description:
+            try:
+                element = driver.find_element(By.CSS_SELECTOR, '.reqResult, #content, body')
+                if element:
+                    html = element.get_attribute('innerHTML')
+                    description = format_description_from_html(html) if html else None
+            except NoSuchElementException:
+                pass
+
+        return {
+            'company': company,
+            'job_title': job_title,
+            'description': description
+        }
+
+    except Exception as e:
+        print(f"    HRMDirect error: {str(e)}")
+        return extract_generic_job_info(driver, url)
+
+
 def extract_job_info_any(driver, url):
     """Extract job info from any supported job site."""
     site_type = get_job_site_type(url)
@@ -314,6 +367,8 @@ def extract_job_info_any(driver, url):
         return extract_greenhouse_job_info(driver, url)
     elif site_type == 'workday':
         return extract_workday_job_info(driver, url)
+    elif site_type == 'hrmdirect':
+        return extract_hrmdirect_job_info(driver, url)
     else:
         return extract_generic_job_info(driver, url)
 
