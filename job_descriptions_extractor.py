@@ -18,6 +18,7 @@ import os
 import re
 import time
 import random
+import argparse
 from openpyxl import load_workbook
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -59,11 +60,19 @@ def is_linkedin_job_url(url):
     return any(re.search(pattern, url) for pattern in linkedin_patterns)
 
 
+def is_valid_url(text):
+    """Check if text looks like a valid URL."""
+    if not text or not isinstance(text, str):
+        return False
+    return text.startswith('http://') or text.startswith('https://')
+
+
 def get_url_from_cell(cell):
     """Extract URL from cell - either from hyperlink or cell value."""
     if cell.hyperlink and cell.hyperlink.target:
         return cell.hyperlink.target
-    if cell.value and isinstance(cell.value, str):
+    # Only return cell value if it looks like a URL
+    if cell.value and isinstance(cell.value, str) and is_valid_url(cell.value):
         return cell.value
     return None
 
@@ -457,6 +466,152 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"/\\|?*]', '', name)
 
 
+def cleanup_skipped_entries(filename):
+    """Remove all SKIPPED and ERROR entries from a txt file.
+
+    Returns the number of entries removed.
+    """
+    if not os.path.exists(filename):
+        return 0
+
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Split by separator
+        parts = re.split(r'(-{40,})', content)
+
+        # Rebuild content, keeping only successful entries
+        new_parts = []
+        removed = 0
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+
+            # Check if this is a job entry (not a separator)
+            if not re.match(r'^-+$', part.strip()):
+                # Check if this entry has SKIPPED or ERROR status
+                if 'Status: SKIPPED' in part or 'Status: ERROR' in part:
+                    removed += 1
+                    # Skip this part and its following separator
+                    i += 1
+                    if i < len(parts) and re.match(r'^-+$', parts[i].strip()):
+                        i += 1
+                    continue
+
+            new_parts.append(part)
+            i += 1
+
+        if removed > 0:
+            # Write cleaned content
+            new_content = ''.join(new_parts)
+            # Clean up any trailing empty sections
+            new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+            new_content = new_content.rstrip() + '\n'
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+
+        return removed
+
+    except Exception as e:
+        print(f"Error cleaning {filename}: {e}")
+        return 0
+
+
+def replace_entry_in_file(filename, url, new_entry_content):
+    """Replace a specific entry in a txt file by matching URL.
+
+    Returns True if replaced, False if not found.
+    """
+    if not os.path.exists(filename):
+        return False
+
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Split into entries
+        entries = re.split(r'(-{40,})', content)
+
+        # Find and replace the entry with matching URL
+        normalized_target = normalize_url(url)
+        replaced = False
+
+        new_entries = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+
+            # Check if this entry contains our URL
+            url_match = re.search(r'URL: (https?://[^\s\n]+)', entry)
+            if url_match:
+                entry_url = url_match.group(1)
+                if normalize_url(entry_url) == normalized_target:
+                    # Replace this entry
+                    new_entries.append(new_entry_content)
+                    replaced = True
+                    i += 1
+                    # Skip the separator after this entry
+                    if i < len(entries) and re.match(r'^-+$', entries[i].strip()):
+                        new_entries.append(entries[i])
+                        i += 1
+                    continue
+
+            new_entries.append(entry)
+            i += 1
+
+        if replaced:
+            new_content = ''.join(new_entries)
+            new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+
+        return replaced
+
+    except Exception as e:
+        print(f"Error replacing entry in {filename}: {e}")
+        return False
+
+
+def get_unresolved_from_files(categories):
+    """Get all unresolved (SKIPPED/ERROR) entries from txt files.
+
+    Returns list of dicts with url, company, title, category info.
+    """
+    unresolved = []
+
+    for category in categories:
+        filename = f"{sanitize_filename(category)}_jobs.txt"
+        if not os.path.exists(filename):
+            continue
+
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            entries = re.split(r'-{40,}', content)
+
+            for entry in entries:
+                if 'Status: SKIPPED' in entry or 'Status: ERROR' in entry:
+                    url_match = re.search(r'URL: (https?://[^\s\n]+)', entry)
+                    company_match = re.search(r'Company: ([^\n]+)', entry)
+                    title_match = re.search(r'Job Title: ([^\n]+)', entry)
+
+                    if url_match:
+                        url = url_match.group(1).strip()
+                        unresolved.append({
+                            'url': url,
+                            'category': category,
+                            'existing_company': company_match.group(1).strip() if company_match else None,
+                            'existing_title': title_match.group(1).strip() if title_match else None,
+                        })
+        except Exception:
+            pass
+
+    return unresolved
+
+
 def normalize_url(url):
     """Normalize LinkedIn URL for comparison (remove tracking params)."""
     if not url:
@@ -508,8 +663,197 @@ def get_existing_urls(filename):
     return result
 
 
+def print_final_summary(categories):
+    """Print final summary of extraction status across all files."""
+    print(f"\n{'='*60}")
+    print("FINAL SUMMARY")
+    print('='*60)
+
+    total_extracted = 0
+    total_skipped = 0
+    unresolved_by_category = {}
+
+    for category in categories:
+        filename = f"{sanitize_filename(category)}_jobs.txt"
+        if not os.path.exists(filename):
+            continue
+
+        url_status = get_existing_urls(filename)
+        extracted = len(url_status['extracted'])
+        skipped = len(url_status['skipped'])
+
+        total_extracted += extracted
+        total_skipped += skipped
+
+        if skipped > 0:
+            unresolved_by_category[category] = skipped
+
+    print(f"\nAcross all files:")
+    print(f"  Successfully extracted: {total_extracted}")
+    print(f"  Skipped/Errors:         {total_skipped}")
+
+    if unresolved_by_category:
+        print(f"\nUnresolved entries by category:")
+        for category, count in unresolved_by_category.items():
+            print(f"  - {category}: {count} unresolved")
+
+        # List the actual unresolved URLs
+        print(f"\nUnresolved URLs:")
+        for category in unresolved_by_category.keys():
+            filename = f"{sanitize_filename(category)}_jobs.txt"
+            try:
+                with open(filename, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    entries = re.split(r'-{40,}', content)
+                    for entry in entries:
+                        if 'Status: SKIPPED' in entry or 'Status: ERROR' in entry:
+                            url_match = re.search(r'URL: ([^\n]+)', entry)
+                            company_match = re.search(r'Company: ([^\n]+)', entry)
+                            if url_match:
+                                url = url_match.group(1).strip()
+                                company = company_match.group(1).strip() if company_match else 'Unknown'
+                                print(f"  - [{category}] {company}: {url[:60]}...")
+            except Exception:
+                pass
+    else:
+        print(f"\nAll jobs successfully extracted!")
+
+
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Extract job descriptions from various job sites')
+    parser.add_argument('--report', action='store_true',
+                        help='Report all unresolved entries with details (no changes made)')
+    parser.add_argument('--cleanup', action='store_true',
+                        help='Remove all SKIPPED/ERROR entries from txt files')
+    parser.add_argument('--retry-all', action='store_true',
+                        help='Retry all unresolved entries from txt files (replaces in-place)')
+    parser.add_argument('--summary', action='store_true',
+                        help='Only show summary of current state, no extraction')
+    args = parser.parse_args()
+
     excel_path = "Job Tracker.xlsx"
+
+    # Get categories from existing files if we're doing cleanup/retry without Excel
+    all_categories = ['Digital', 'Analog', 'Embedded', 'hardware', 'Power', 'AI/ML', 'Controls']
+
+    # Handle --report flag - detailed report of issues
+    if args.report:
+        print("="*60)
+        print("UNRESOLVED ENTRIES REPORT")
+        print("="*60)
+
+        unresolved = get_unresolved_from_files(all_categories)
+
+        if not unresolved:
+            print("\nNo unresolved entries found! All jobs extracted successfully.")
+            return
+
+        # Group by category
+        by_category = {}
+        for job in unresolved:
+            cat = job['category']
+            if cat not in by_category:
+                by_category[cat] = []
+            by_category[cat].append(job)
+
+        print(f"\nFound {len(unresolved)} unresolved entries:\n")
+
+        for category, jobs in by_category.items():
+            print(f"\n{category} ({len(jobs)} issues):")
+            print("-" * 40)
+            for job in jobs:
+                site_type = get_job_site_type(job['url'])
+                print(f"  Company: {job['existing_company'] or 'N/A'}")
+                print(f"  Title:   {job['existing_title'] or 'N/A'}")
+                print(f"  Site:    {site_type}")
+                print(f"  URL:     {job['url']}")
+                print()
+
+        print("\nTo retry these, run: python job_descriptions_extractor.py --retry-all")
+        print("To remove them,  run: python job_descriptions_extractor.py --cleanup")
+        return
+
+    # Handle --cleanup flag
+    if args.cleanup:
+        print("Cleaning up SKIPPED/ERROR entries from txt files...")
+        total_removed = 0
+        for category in all_categories:
+            filename = f"{sanitize_filename(category)}_jobs.txt"
+            removed = cleanup_skipped_entries(filename)
+            if removed > 0:
+                print(f"  {category}: removed {removed} entries")
+                total_removed += removed
+        print(f"\nTotal removed: {total_removed} entries")
+        if not args.retry_all:
+            return
+
+    # Handle --retry-all flag
+    if args.retry_all:
+        print("\nRetrying all unresolved entries from txt files...")
+        unresolved = get_unresolved_from_files(all_categories)
+
+        if not unresolved:
+            print("No unresolved entries found!")
+            return
+
+        print(f"Found {len(unresolved)} unresolved entries to retry")
+
+        # Set up browser and retry
+        print("\nSetting up browser...")
+        driver = setup_driver()
+        errors = []
+        successes = []
+
+        try:
+            for i, job in enumerate(unresolved):
+                url = job['url']
+                category = job['category']
+                filename = f"{sanitize_filename(category)}_jobs.txt"
+
+                print(f"\n[{i+1}/{len(unresolved)}] {category}...")
+                print(f"  URL: {url[:50]}...")
+
+                info = extract_job_info_any(driver, url)
+
+                if info and info.get('description'):
+                    company = info['company'] or job['existing_company'] or 'N/A'
+                    title = info['job_title'] or job['existing_title'] or 'N/A'
+                    description = info['description']
+
+                    # Build new entry content
+                    new_entry = f"\nCompany: {company}\n"
+                    new_entry += f"Job Title: {title}\n"
+                    new_entry += f"URL: {url}\n"
+                    new_entry += f"\n{description}\n"
+
+                    # Replace in-place
+                    if replace_entry_in_file(filename, url, new_entry):
+                        print(f"  Success (replaced): {company} - {title}")
+                        successes.append(f"{category}: {company}")
+                    else:
+                        print(f"  Success (appended): {company} - {title}")
+                        # If not found, append
+                        with open(filename, 'a', encoding='utf-8') as f:
+                            f.write(new_entry)
+                            f.write(f"\n{'-'*40}\n\n")
+                        successes.append(f"{category}: {company}")
+                else:
+                    print(f"  Failed to extract")
+                    errors.append({'category': category, 'url': url, 'company': job['existing_company']})
+
+                time.sleep(random.uniform(2, 4))
+
+        finally:
+            driver.quit()
+
+        print(f"\n{'='*60}")
+        print(f"Retry complete: {len(successes)} succeeded, {len(errors)} failed")
+        if errors:
+            print("\nStill failing (entries unchanged in files):")
+            for err in errors:
+                print(f"  - [{err['category']}] {err['company'] or 'Unknown'}: {err['url'][:50]}...")
+        return
 
     print(f"Reading {excel_path}...")
     wb = load_workbook(excel_path)
@@ -609,8 +953,14 @@ def main():
 
     print(f"\nTotal: {total_already_done} jobs already extracted, {total_retry_skipped} previously skipped (retrying), {total_new_jobs} to process")
 
+    # Handle --summary flag
+    if args.summary:
+        print_final_summary(jobs_by_category)
+        return
+
     if total_new_jobs == 0:
         print("\nNo new jobs to extract. All jobs are already in the text files.")
+        print_final_summary(jobs_by_category)
         return
 
     # Set up browser
@@ -714,6 +1064,8 @@ def main():
 
     print(f"\nDone! Processed {processed} jobs.")
     print(f"Output files created for categories: {list(jobs_by_category.keys())}")
+
+    print_final_summary(jobs_by_category.keys())
 
 
 if __name__ == "__main__":
